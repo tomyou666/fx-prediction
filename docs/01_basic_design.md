@@ -1,5 +1,12 @@
 # 1. 基本設計
 
+本プロジェクトは、論文「**Enhancing stock index prediction: A hybrid LSTM-PSO model for improved forecasting accuracy**」を参考にした設計である。PSO（粒子群最適化）で LSTM のハイパーパラメータを最適化し、**5分足の終値**を予測するハイブリッドモデルを実装する。
+
+- 詳細設計（理論）→ [02_detailed_design_theory.md](02_detailed_design_theory.md)  
+- 詳細設計（実装）→ [03_detailed_design_implementation.md](03_detailed_design_implementation.md)
+
+---
+
 ## 1.1 本プロジェクトの概要
 
 ### プロジェクトの目的
