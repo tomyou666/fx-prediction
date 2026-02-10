@@ -1,5 +1,5 @@
 {
-  "name": "TensorFlow GPU (Python 3.11)",
+  "name": "${localWorkspaceFolderBasename}",
   "build": {
     "context": "..",
     "dockerfile": "Dockerfile"
