@@ -9,4 +9,4 @@ best_model_*.keras
 pso_log_*.csv
 final_log_*.csv
 *.pyc
-test_result.npz
+*.npz
