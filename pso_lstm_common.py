@@ -2,7 +2,7 @@
 PSO-LSTM 為替予測の共通モジュール（設計書準拠）。
 データ読込・前処理（MODWTローリング・テクニカル・周期エンコーディング）・
 シーケンス作成・EWMAスケーリング・LSTM構築・PSO・評価を提供する。
-目的変数: 1本先の対数収益 y_t = ln(P_{t+1}/P_t)。
+目的変数: TARGET_HORIZON 本先の対数収益 y_t = ln(P_{t+h}/P_t)。h は共通パラメータで指定。
 """
 
 from __future__ import annotations
@@ -20,7 +20,8 @@ from typing import Any
 
 # 定数（設計書付録）
 L2_LAMBDA = 1e-4
-BATCH_SIZE = 64
+DROPOUT_RATE = 0.2
+BATCH_SIZE = 1024
 NEURON_BOUNDS = (50, 300)
 EPOCH_BOUNDS = (50, 300)
 LAYER_BOUNDS = (1, 3)
@@ -34,6 +35,8 @@ WT_WAVELET = "haar"
 CLIP_SIGMA = 3
 CORR_THRESHOLD = 0.95
 PERIOD_COLS = ("dow_sin", "dow_cos", "hour_sin", "hour_cos")
+# 何本先の対数収益で学習・推論するか（設計書 TARGET_HORIZON）。6 のときは 6 本先。
+TARGET_HORIZON = 6
 # 対数収益のスケーリング係数（学習時に掛ける。評価・可視化前に 1/TARGET_SCALE を掛けて戻す）
 TARGET_SCALE = 1e4
 
@@ -264,10 +267,14 @@ def preprocess_5m_pipeline(
     df: pd.DataFrame,
     wavelet: str = WT_WAVELET,
     level: int = WT_LEVEL,
+    steps_ahead: int | None = None,
 ) -> pd.DataFrame:
     """設計書に沿った5分足前処理パイプライン。
     リサンプル済みのDataFrameを受け、対数比率+WT・テクニカル・周期・目的変数まで一括適用する。
+    steps_ahead: 何本先の対数収益を目的変数にするか。None のときは TARGET_HORIZON を使用。
     """
+    if steps_ahead is None:
+        steps_ahead = TARGET_HORIZON
     # マクロは前方補完（CSV結合済みの場合はffillのみ）
     out = df.ffill()
     price_cols = [
@@ -284,17 +291,23 @@ def preprocess_5m_pipeline(
     out = add_usd_eur_log_diff(out, wavelet=wavelet, level=level)
     out = add_technical_indicators_log_diff(out)
     out = add_period_encoding(out)
-    out["target_log_return"] = build_target_log_return(out, close_col="close")
+    out["target_log_return"] = build_target_log_return(
+        out, close_col="close", steps_ahead=steps_ahead
+    )
     return out
 
 
 def build_target_log_return(
     df: pd.DataFrame,
     close_col: str = "close",
+    steps_ahead: int | None = None,
 ) -> pd.Series:
-    """1本先の対数収益 y_t = ln(P_{t+1}/P_t) を計算して返す。"""
+    """steps_ahead 本先の対数収益 y_t = ln(P_{t+h}/P_t) を計算して返す。
+    steps_ahead が None のときは TARGET_HORIZON を使用。末尾 h 行は NaN。"""
+    if steps_ahead is None:
+        steps_ahead = TARGET_HORIZON
     close = pd.Series(np.asarray(df[close_col]).ravel(), index=df.index)
-    next_close = close.shift(-1)
+    next_close = close.shift(-steps_ahead)
     log_ret = np.log(next_close / close)
     log_ret.name = "target_log_return"
     return log_ret
@@ -555,11 +568,14 @@ def build_lstm_model(
     num_layers: int,
     num_units: int,
     l2_lambda: float | None = None,
+    dropout_rate: float | None = None,
     dense_units: int | None = None,
 ) -> keras.Model:
     """指定した層数・ユニット数でスタックLSTMを構築。出力はスカラー（1時点先の対数収益）。"""
     if l2_lambda is None:
         l2_lambda = L2_LAMBDA
+    if dropout_rate is None:
+        dropout_rate = DROPOUT_RATE
     if dense_units is None:
         dense_units = num_units
     l2_reg = keras.regularizers.l2(l2_lambda)
@@ -588,18 +604,18 @@ def build_lstm_model(
                     **lstm_kw,
                 )
             )
-        model.add(layers.Dropout(0.2))
+        model.add(layers.Dropout(dropout_rate))
     model.add(
         layers.Dense(
-            dense_units,
+            1024,
             activation="relu",
             kernel_regularizer=l2_reg,
             bias_regularizer=l2_reg,
         )
     )
-    model.add(layers.Dropout(0.2))
+    model.add(layers.Dropout(dropout_rate))
     model.add(layers.Dense(1, kernel_regularizer=l2_reg, bias_regularizer=l2_reg))
-    model.compile(optimizer="adam", loss="mse")
+    model.compile(optimizer="adam", loss="mae")
     return model
 
 
