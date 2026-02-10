@@ -2,9 +2,11 @@
 id_rsa
 backup/
 example/
+data/
 
 # PSO-LSTM ノートブックの保存ファイル
 best_model_*.keras
 pso_log_*.csv
 final_log_*.csv
 *.pyc
+test_result.npz

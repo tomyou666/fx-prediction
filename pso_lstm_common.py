@@ -34,6 +34,8 @@ WT_WAVELET = "haar"
 CLIP_SIGMA = 3
 CORR_THRESHOLD = 0.95
 PERIOD_COLS = ("dow_sin", "dow_cos", "hour_sin", "hour_cos")
+# 対数収益のスケーリング係数（学習時に掛ける。評価・可視化前に 1/TARGET_SCALE を掛けて戻す）
+TARGET_SCALE = 1e4
 
 # CSVで使用する列（US02Y_close は使用しない）
 CSV_PRICE_COLS = ["open", "high", "low", "close", "volume", "vwap"]
@@ -111,7 +113,11 @@ def _modwt_rolling_one(
             cD_th = pywt.threshold(cD, uthresh, mode="soft")
             new_coeffs.append((cA, cD_th))
         rec = pywt.iswt(new_coeffs, wavelet)
-        return float(rec[-1])
+        val = float(rec[-1])
+        # sigma=0 のときは閾値処理なし＝再構成は入力に近い。iswt が NaN を返すことがあるので窓末尾で補う
+        if np.isnan(val) and not np.any(np.isnan(window)) and np.isfinite(window[-1]):
+            val = float(window[-1])
+        return val
     except Exception:
         return np.nan
 
@@ -128,6 +134,8 @@ def modwt_rolling_denoise(
     if window_len is None:
         window_len = max(64, 2**level * 8)
     arr = np.asarray(series, dtype=np.float64).ravel()
+    # inf は pywt で NaN を生むため、事前に NaN に置換
+    arr = np.where(np.isinf(arr), np.nan, arr)
     out = np.full(len(arr), np.nan, dtype=np.float64)
     for t in range(len(arr)):
         out[t] = _modwt_rolling_one(arr, t, window_len, wavelet, level)
@@ -167,7 +175,9 @@ def add_usd_eur_log_diff(
     if "close" not in df.columns or "EURJPY_close" not in df.columns:
         return df
     # 対数剥離: ln(USDJPY) - ln(EURJPY) のスプレッド的な量
-    log_diff = np.log(df["close"].astype(float)) - np.log(df["EURJPY_close"].astype(float))
+    log_diff = np.log(df["close"].astype(float)) - np.log(
+        df["EURJPY_close"].astype(float)
+    )
     log_diff = pd.Series(log_diff.values, index=df.index)
     wt_s = modwt_rolling_denoise(log_diff, wavelet=wavelet, level=level)
     df = df.copy()
@@ -189,7 +199,8 @@ def add_technical_indicators_log_diff(df: pd.DataFrame) -> pd.DataFrame:
         out["low"].astype(float),
         close,
     )
-    out["ln_cci_diff"] = np.log(1.0 + cci / (close + 1e-10))
+    # CCI は -300～+300 程度。300 を足して 0 以上にしつつ水準を保つ（abs より情報量が多い）
+    out["ln_cci_diff"] = np.log(1.0 + np.maximum(0, cci + 300) / (close + 1e-10))
 
     atr = ta.volatility.average_true_range(
         out["high"].astype(float),
@@ -259,13 +270,17 @@ def preprocess_5m_pipeline(
     """
     # マクロは前方補完（CSV結合済みの場合はffillのみ）
     out = df.ffill()
-    price_cols = [c for c in ["open", "high", "low", "close", "volume"] if c in out.columns]
+    price_cols = [
+        c for c in ["open", "high", "low", "close", "volume"] if c in out.columns
+    ]
     out = add_log_ratio_and_wt(out, price_cols, wavelet=wavelet, level=level)
     if "EURJPY_close" in out.columns:
         eur_jpy = out["EURJPY_close"].astype(float)
         log_ratio = np.log(eur_jpy / eur_jpy.shift(1))
         log_ratio = log_ratio.replace([np.inf, -np.inf], np.nan)
-        out["eur_jpy_ln_close"] = modwt_rolling_denoise(log_ratio, wavelet=wavelet, level=level)
+        out["eur_jpy_ln_close"] = modwt_rolling_denoise(
+            log_ratio, wavelet=wavelet, level=level
+        )
     out = add_usd_eur_log_diff(out, wavelet=wavelet, level=level)
     out = add_technical_indicators_log_diff(out)
     out = add_period_encoding(out)
@@ -322,7 +337,11 @@ def remove_high_corr_features(
     vals = np.asarray(corr_series).ravel()
     is_high = vals > threshold
     not_self = np.array([n != target_col for n in names], dtype=bool)
-    drop_cols = [names[i] for i in range(len(names)) if is_high[i] and not_self[i] and names[i] not in protect]
+    drop_cols = [
+        names[i]
+        for i in range(len(names))
+        if is_high[i] and not_self[i] and names[i] not in protect
+    ]
     return df.drop(columns=drop_cols), drop_cols
 
 
@@ -351,7 +370,9 @@ def create_sequences(
 
     if close_series is not None:
         # サンプル i は時点 lookback+i に対応。復元用 last_close は close[lookback+i]
-        last_close = np.asarray(close_series.iloc[lookback : len(features)], dtype=np.float64)
+        last_close = np.asarray(
+            close_series.iloc[lookback : len(features)], dtype=np.float64
+        )
         return X, y, last_close
     if close_col_idx is not None:
         last_close = features[np.arange(lookback - 1, len(features) - 1), close_col_idx]
@@ -430,7 +451,9 @@ class EWMAScaler:
             )
         self.scale_cols_ = scale_cols
         ewma_mean = np.zeros(n_features)
-        ewma_mean[scale_cols] = np.nan_to_num(X_flat[0, scale_cols], nan=0.0, posinf=0.0, neginf=0.0)
+        ewma_mean[scale_cols] = np.nan_to_num(
+            X_flat[0, scale_cols], nan=0.0, posinf=0.0, neginf=0.0
+        )
         ewma_var = np.ones(n_features) * self.eps
         for i in range(len(X_flat)):
             x = X_flat[i]
@@ -442,9 +465,13 @@ class EWMAScaler:
                 ewma_mean[scale_cols] + clip_val[scale_cols],
             )
             old_mean = ewma_mean[scale_cols].copy()
-            ewma_mean[scale_cols] = self.alpha * x_clipped[scale_cols] + (1 - self.alpha) * ewma_mean[scale_cols]
+            ewma_mean[scale_cols] = (
+                self.alpha * x_clipped[scale_cols]
+                + (1 - self.alpha) * ewma_mean[scale_cols]
+            )
             ewma_var[scale_cols] = (
-                self.alpha * (x_clipped[scale_cols] - old_mean) ** 2 + (1 - self.alpha) * ewma_var[scale_cols]
+                self.alpha * (x_clipped[scale_cols] - old_mean) ** 2
+                + (1 - self.alpha) * ewma_var[scale_cols]
             )
         self.ewma_mean_ = ewma_mean
         self.ewma_var_ = ewma_var
@@ -477,11 +504,18 @@ class EWMAScaler:
                 mean[scale_cols] + clip_val[scale_cols],
             )
             x_scaled = x.copy()
-            x_scaled[scale_cols] = (x_clipped[scale_cols] - mean[scale_cols]) / (std[scale_cols] + self.eps)
+            x_scaled[scale_cols] = (x_clipped[scale_cols] - mean[scale_cols]) / (
+                std[scale_cols] + self.eps
+            )
             out_flat[i] = x_scaled
             old_mean = mean[scale_cols].copy()
-            mean[scale_cols] = self.alpha * x_clipped[scale_cols] + (1 - self.alpha) * mean[scale_cols]
-            var[scale_cols] = self.alpha * (x_clipped[scale_cols] - old_mean) ** 2 + (1 - self.alpha) * var[scale_cols]
+            mean[scale_cols] = (
+                self.alpha * x_clipped[scale_cols] + (1 - self.alpha) * mean[scale_cols]
+            )
+            var[scale_cols] = (
+                self.alpha * (x_clipped[scale_cols] - old_mean) ** 2
+                + (1 - self.alpha) * var[scale_cols]
+            )
             std = np.sqrt(var + self.eps)
             clip_val = self.clip_sigma * std
         out = out_flat.reshape(X_3d.shape)
