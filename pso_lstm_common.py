@@ -19,9 +19,9 @@ import pyswarms as ps
 from typing import Any
 
 # 定数（設計書付録）
-L2_LAMBDA = 1e-4
-DROPOUT_RATE = 0.2
-BATCH_SIZE = 1024
+L2_LAMBDA = 0
+DROPOUT_RATE = 0.0
+BATCH_SIZE = 256
 NEURON_BOUNDS = (50, 300)
 EPOCH_BOUNDS = (50, 300)
 LAYER_BOUNDS = (1, 3)
@@ -30,7 +30,7 @@ PSO_C1 = 1.5
 PSO_C2 = 1.5
 PSO_PARTICLES = 20
 PSO_ITERS = 5
-WT_LEVEL = 3
+WT_LEVEL = 2
 WT_WAVELET = "haar"
 CLIP_SIGMA = 3
 CORR_THRESHOLD = 0.95
@@ -563,6 +563,108 @@ def scale_ewma_train_val_test(
     return X_train_s, X_val_s, X_test_s, scaler
 
 
+def scale_target_ewma(
+    target_full: np.ndarray,
+    lookback: int,
+    target_horizon: int,
+    alpha: float = 0.06,
+    clip_sigma: float = CLIP_SIGMA,
+    eps: float = 1e-8,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """目的変数を EWMA でローリング標準化する。設計書準拠。
+    t 時点では Y_{t-target_horizon} までしか観測されないため、
+    Y_{t-h} ～ Y_{t-h-L+1}（L=lookback）の窓で μ・σ を算出し、±clip_sigma*σ でクリップしてから標準化する。
+
+    Parameters
+    ----------
+    target_full : np.ndarray
+        生の目的変数（長さ N = 特徴量行数）。create_sequences に渡す前の target 列。
+    lookback : int
+        シーケンスのルックバック長 L。
+    target_horizon : int
+        TARGET_HORIZON（h）。何本先の対数収益か。
+    alpha : float
+        EWMA の平滑化係数。
+    clip_sigma : float
+        クリップに使う σ の倍数（±clip_sigma*σ）。
+    eps : float
+        分散のゼロ除算防止。
+
+    Returns
+    -------
+    y_scaled : np.ndarray
+        標準化された目的変数。長さ N - lookback（シーケンス数に一致）。
+    mu_arr : np.ndarray
+        各サンプルに対応する μ_t。逆変換用。
+    sigma_arr : np.ndarray
+        各サンプルに対応する σ_t。逆変換用。
+    """
+    target_full = np.asarray(target_full, dtype=np.float64).ravel()
+    n_full = len(target_full)
+    n_samples = n_full - lookback
+    if n_samples <= 0:
+        raise ValueError("target_full の長さは lookback より大きい必要があります")
+    h = target_horizon
+    L = lookback
+
+    y_scaled = np.full(n_samples, np.nan, dtype=np.float64)
+    mu_arr = np.full(n_samples, np.nan, dtype=np.float64)
+    sigma_arr = np.full(n_samples, np.nan, dtype=np.float64)
+
+    for k in range(n_samples):
+        t = lookback + k  # このサンプルの目的変数は target_full[t]
+        start = t - h - L + 1
+        end = t - h + 1
+        if end <= 0:
+            # 窓が取れない場合は mean=0, std=1 で標準化しない（そのまま or NaN）
+            mu_arr[k] = 0.0
+            sigma_arr[k] = 1.0
+            val = np.nan_to_num(target_full[t], nan=0.0, posinf=0.0, neginf=0.0)
+            y_scaled[k] = val
+            continue
+        start = max(0, start)
+        window = target_full[start:end].astype(np.float64)
+        window = np.nan_to_num(window, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # 窓内で EWMA で μ, σ を算出（逐次更新）
+        ewma_mean = window[0]
+        ewma_var = eps
+        for v in window:
+            clip_val = clip_sigma * np.sqrt(ewma_var + eps)
+            v_clip = np.clip(v, ewma_mean - clip_val, ewma_mean + clip_val)
+            old_mean = ewma_mean
+            ewma_mean = alpha * v_clip + (1 - alpha) * ewma_mean
+            ewma_var = alpha * (v_clip - old_mean) ** 2 + (1 - alpha) * ewma_var
+
+        mu = ewma_mean
+        sigma = np.sqrt(ewma_var + eps)
+        clip_val = clip_sigma * sigma
+        y_raw = np.nan_to_num(target_full[t], nan=0.0, posinf=0.0, neginf=0.0)
+        y_clip = np.clip(y_raw, mu - clip_val, mu + clip_val)
+        y_scaled[k] = (y_clip - mu) / sigma
+        mu_arr[k] = mu
+        sigma_arr[k] = sigma
+
+    return y_scaled, mu_arr, sigma_arr
+
+
+def inverse_scale_target(
+    y_scaled: np.ndarray,
+    mu_arr: np.ndarray,
+    sigma_arr: np.ndarray,
+) -> np.ndarray:
+    """標準化された目的変数を元の対数収益スケールに戻す。ŷ = ŷ' * σ_t + μ_t"""
+    return np.asarray(y_scaled, dtype=np.float64) * np.asarray(
+        sigma_arr, dtype=np.float64
+    ) + np.asarray(mu_arr, dtype=np.float64)
+
+
+def sample_weights_from_scaled_target(y_scaled: np.ndarray) -> np.ndarray:
+    """標準化後の目的変数からサンプル重み w_t = 1 + |y'_t| を計算する。"""
+    y = np.asarray(y_scaled, dtype=np.float64).ravel()
+    return (1.0 + np.abs(y)).astype(np.float64)
+
+
 def build_lstm_model(
     input_shape: tuple[int, ...],
     num_layers: int,
@@ -615,7 +717,7 @@ def build_lstm_model(
     )
     model.add(layers.Dropout(dropout_rate))
     model.add(layers.Dense(1, kernel_regularizer=l2_reg, bias_regularizer=l2_reg))
-    model.compile(optimizer="adam", loss="mae")
+    model.compile(optimizer="adam", loss="mse")
     return model
 
 
@@ -637,8 +739,13 @@ def pso_optimize(
     pso_particles: int | None = None,
     pso_iters: int | None = None,
     strategy: tf.distribute.Strategy | None = None,
+    sample_weight_train: np.ndarray | None = None,
+    mu_val: np.ndarray | None = None,
+    sigma_val: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float]:
     """PSOでLSTMのハイパーパラメータを探索し、検証RMSEを最小化する。
+    sample_weight_train を渡すと学習時にサンプル重みを適用する。
+    mu_val, sigma_val を渡すと検証予測を逆変換して元スケールで RMSE を計算する。
     戻り値: (best_pos, best_cost)。best_pos は [ユニット数, エポック数, 層数]。
     """
     batch_size = batch_size or BATCH_SIZE
@@ -669,17 +776,26 @@ def pso_optimize(
                 restore_best_weights=True,
             )
             csv_log = keras.callbacks.CSVLogger(csv_log_path)
-            model.fit(
-                X_train,
-                y_train,
+            fit_kw: dict[str, Any] = dict(
                 validation_data=(X_val, y_val),
                 epochs=epochs,
                 batch_size=batch_size,
                 verbose=0,
                 callbacks=[es, csv_log],
             )
+            if sample_weight_train is not None:
+                fit_kw["sample_weight"] = sample_weight_train
+            model.fit(X_train, y_train, **fit_kw)
             preds = model.predict(X_val, verbose=0)
-            rmse = np.sqrt(mean_squared_error(y_val, preds))
+            preds = np.asarray(preds).ravel()
+            if mu_val is not None and sigma_val is not None:
+                preds_orig = inverse_scale_target(preds, mu_val, sigma_val)
+                y_val_orig = inverse_scale_target(
+                    np.asarray(y_val).ravel(), mu_val, sigma_val
+                )
+                rmse = np.sqrt(mean_squared_error(y_val_orig, preds_orig))
+            else:
+                rmse = np.sqrt(mean_squared_error(y_val, preds))
             costs.append(rmse)
         return np.array(costs)
 

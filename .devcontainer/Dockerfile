@@ -17,4 +17,5 @@ RUN apt-get clean -y && rm -rf /var/lib/apt/lists/*
 
 RUN echo 'source "$HOME/.local/bin/env"' >> ~/.bashrc
 RUN echo "export UV_LINK_MODE=copy" >> ~/.bashrc
+RUN echo "export TF_GPU_ALLOCATOR=cuda_malloc_async" >> ~/.bashrc
 COPY --from=builder /root/.local/ /root/.local/
